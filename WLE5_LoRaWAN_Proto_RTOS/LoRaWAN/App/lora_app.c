@@ -346,13 +346,26 @@ const osThreadAttr_t Thd_LmHandlerProcess_attr =
 static void Thd_LmHandlerProcess(void *argument);
 
 /* USER CODE BEGIN PV */
+char *ToHexBuffer(uint8_t *buffer, uint8_t size) {
+	static char buf[770] = {0};
+
+	memset(buf, 0, sizeof(buf));
+	char *ptr = (char *)buf;
+	for(uint8_t i=0; i<size-1; i++){
+		snprintf(ptr, 4, "%02x,", buffer[i]);
+		ptr += 3;
+	}
+
+	snprintf(ptr, 3, "%02x", buffer[size-1]);
+
+	return buf;
+}
 /* USER CODE END PV */
 
 /* Exported functions ---------------------------------------------------------*/
 /* USER CODE BEGIN EF */
 static uint8_t AppDataBuffer[242] = "Hello";
 static LmHandlerAppData_t AppData = { 0, 0, AppDataBuffer };
-static TimerEvent_t timer_CtrlCmdRequest;
 static void OnTimerCtrlCmdRequest(void*);
 /* USER CODE END EF */
 
@@ -400,25 +413,22 @@ void LoRaWAN_Init(void)
 
   /* USER CODE BEGIN LoRaWAN_Init_2 */
   APP_LOG(TS_ON, VLEVEL_L, "Init\r\n");
-	TimerInit(&timer_CtrlCmdRequest, OnTimerCtrlCmdRequest);
-	TimerSetValue(&timer_CtrlCmdRequest, 10*1000U);
-//	TimerStop(&timer_CtrlCmdRequest);
   /* USER CODE END LoRaWAN_Init_2 */
 
   LmHandlerJoin(ActivationType, ForceRejoin);
 
-//  if (EventType == TX_ON_TIMER)
-//  {
-//    /* send every time timer elapses */
-//    UTIL_TIMER_Create(&TxTimer, TxPeriodicity, UTIL_TIMER_ONESHOT, OnTxTimerEvent, NULL);
-//    UTIL_TIMER_Start(&TxTimer);
-//  }
-//  else
-//  {
-//    /* USER CODE BEGIN LoRaWAN_Init_3 */
-//
-//    /* USER CODE END LoRaWAN_Init_3 */
-//  }
+  if (EventType == TX_ON_TIMER)
+  {
+    /* send every time timer elapses */
+    UTIL_TIMER_Create(&TxTimer, TxPeriodicity, UTIL_TIMER_ONESHOT, OnTxTimerEvent, NULL);
+    UTIL_TIMER_Start(&TxTimer);
+  }
+  else
+  {
+    /* USER CODE BEGIN LoRaWAN_Init_3 */
+
+    /* USER CODE END LoRaWAN_Init_3 */
+  }
 
   /* USER CODE BEGIN LoRaWAN_Init_Last */
 
@@ -455,12 +465,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
 /* Private functions ---------------------------------------------------------*/
 /* USER CODE BEGIN PrFD */
-static void OnTimerCtrlCmdRequest(void*){
-	TimerStop(&timer_CtrlCmdRequest);
-	TimerStart(&timer_CtrlCmdRequest);
 
-	APP_LOG(TS_ON, VLEVEL_L, "OnTimerCtrlCmdRequest\r\n");
-}
 /* USER CODE END PrFD */
 
 static void Thd_LmHandlerProcess(void *argument)
@@ -535,7 +540,7 @@ static void OnRxData(LmHandlerAppData_t *appData, LmHandlerRxParams_t *params)
   /* USER CODE BEGIN OnRxData_1 */
 	APP_LOG(TS_ON, VLEVEL_L, "OnRxData\r\n");
 	if (appData->BufferSize > 0){
-		APP_LOG(TS_ON, VLEVEL_L, "*********RX PORT %d, DATA: %s\r\n", appData->Port, appData->Buffer);
+		APP_LOG(TS_ON, VLEVEL_L, "*********RX PORT %d, DATA: %s\r\n", appData->Port, ToHexBuffer(appData->Buffer, appData->BufferSize));
 	}
   /* USER CODE END OnRxData_1 */
 }
@@ -597,8 +602,7 @@ static void OnJoinRequest(LmHandlerJoinParams_t *joinParams)
   /* USER CODE BEGIN OnJoinRequest_1 */
 	APP_LOG(TS_ON, VLEVEL_L, "OnJoinRequest %d\r\n", joinParams->Status);
 	if (joinParams->Status == 0) {
-//		TimerSetValue(&timer_CtrlCmdRequest, 10*1000U);
-		TimerStart(&timer_CtrlCmdRequest);
+
 	}
 	else
 		LmHandlerJoin(ActivationType, ForceRejoin);
