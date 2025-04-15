@@ -1,4 +1,3 @@
-
 #ifndef __FUNC_H__
 #define __FUNC_H__
 
@@ -46,7 +45,7 @@ typedef struct end_device {
     float humidity          = 0.0;      /* Sensor humidity value in percent */
     uint8_t battlevel       = 0.0;      /* Device battery level [00;FF] */
     uint8_t index           = 0;        /* Device index in vector */
-    end_device *pair_dev   = nullptr;
+    end_device *pair_dev    = nullptr;
 } end_device_t;
 
 

@@ -1,11 +1,16 @@
 #include <iostream>
 #include <mosquitto.h>
 #include <sstream>
+#include <iomanip>
+#include <curl/curl.h>
 #include <vector>
 #include <bits/stdc++.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <unistd.h>
+#include <pthread.h>
+
 #include "func.h"
 
 
@@ -16,9 +21,11 @@ typedef struct {
     std::string appid;
     std::string deveui;
     std::string devname;
-    uint8_t devidx;
+    int devidx;
     std::vector<uint8_t> data_hex;
 } event_data_t;
+
+using json = nlohmann::json;
 
 static std::vector<end_device_t *> vec_end_devices;
 static end_device_t *sensor_pairing;
@@ -26,24 +33,160 @@ static end_device_t *vent_pairing;
 static bool pairing = false;
 static Timer pair_timeout_timer;
 
+const std::string postUrl = "http://192.168.1.11:1880/sensor-data";
+const std::string getUrl = "http://192.168.1.11:1880/get-sensor-data";
 
 void handle_topic(struct mosquitto *mosq, const std::vector<std::string> &tokens, const std::string &payload);
 void mqttc_on_connect(struct mosquitto *mosq, void *userdata, int state);
 void mqttc_on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message);
 int schedule_downlink(struct mosquitto *mosq, event_data_t *evt_data, std::vector<uint8_t> down_data_hex); /* ??? */
 void handle_uplink_data(struct mosquitto *mosq, event_data_t *evt_data);
-void pair_timeout_timer_handler(void);
 
-void vent_set_state(std::string deveui, uint8_t state);
-void sensor_display_env_data(event_data_t *evt_data);
-void sensor_change_set_temperature(std::string deveui, float set);
+std::string test_json_get = R"(
+    {
+        "chairId": "1",
+        "deviceId": "ba84ca62714f81fc",
+        "status": "0",
+        "customer": "Viktor Axelsen",
+        "chairRule": "1.5",
+        "timeStart": "2025-01-01 01:01",
+        "timeEnd": "2025-01-01 01:05",
+        "currentTime": "2025-01-01 02:30"
+    }
+)";
+
+std::string test_json_post = R"(
+    {
+        "chairId": "1",
+        "deviceId": "ba84ca62714f81fc",
+        "status": "0",
+        "battery": "90",
+        "latitude": "101.23264",
+        "longitude": "-33.54657465"
+    }
+)";
+
+std::vector<uint8_t> downlink_payload_test;
+
+std::tm parse_time(const std::string& time_str) {
+    std::tm tm = {};
+    std::istringstream ss(time_str);
+    ss >> std::get_time(&tm, "%Y-%m-%d %H:%M");
+    return tm;
+}
+
+uint32_t calculate_duration(const std::string& start, const std::string& end) {
+    std::tm start_tm = parse_time(start);
+    std::tm end_tm = parse_time(end);
+
+    time_t start_time = mktime(&start_tm);
+    time_t end_time = mktime(&end_tm);
+
+    return static_cast<uint32_t>(difftime(end_time, start_time) / 60); // phút
+}
+
+void build_downlink_payload(const std::string& json_str, std::vector<uint8_t>& payload) {
+    json data = json::parse(json_str);
+
+    uint32_t chairId = std::stoul(data["chairId"].get<std::string>());
+    std::string customer = data["customer"].get<std::string>();
+    std::string timeStart = data["timeStart"].get<std::string>();
+    std::string timeEnd = data["timeEnd"].get<std::string>();
+
+    uint32_t duration = calculate_duration(timeStart, timeEnd);
+    std::cout << "duration: " << duration << std::endl;
+
+    // 1. Push chairId (1 bytes - Little Endian)
+    payload.push_back((chairId >> 0) & 0xFF);
+
+    // 2. Push duration (4 bytes - Little Endian)
+    payload.push_back((duration >> 0) & 0xFF);
+    payload.push_back((duration >> 8) & 0xFF);
+    payload.push_back((duration >> 16) & 0xFF);
+    payload.push_back((duration >> 24) & 0xFF);
+
+    // 3. Push customer name (30 bytes, padding nếu ngắn)
+    const size_t MAX_NAME_LEN = 30;
+    for (size_t i = 0; i < MAX_NAME_LEN; ++i) {
+        if (i < customer.size()) {
+            payload.push_back(static_cast<uint8_t>(customer[i]));
+        } else {
+            payload.push_back(0);  // padding bằng null byte
+        }
+    }
+}
+
+void print_payload_hex(const std::vector<uint8_t>& payload) {
+    std::cout << "Downlink Payload (hex): ";
+    for (uint8_t byte : payload) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)byte << "";
+    }
+    std::cout << std::endl;
+}
+//------------------------------------------------------------//
+std::string bytesToHexString(const std::vector<uint8_t>& data) {
+    std::ostringstream oss;
+    for (uint8_t byte : data) {
+        oss << std::hex << std::uppercase << std::setfill('0') << std::setw(2) << (int)byte;
+    }
+    return oss.str();
+}
+
+float bytesToFloat(const uint8_t* bytes) {
+    float value;
+    std::memcpy(&value, bytes, sizeof(float));
+    return value;
+}
+
+std::string generateJsonFromData(const std::vector<uint8_t>& data) {
+    if (data.size() != 10) {
+        throw std::runtime_error("Invalid data length! Expect 10 bytes.");
+    }
+
+    uint8_t chairId = data[0];
+
+    float latitude = bytesToFloat(&data[1]);
+    float longitude = bytesToFloat(&data[5]);
+
+    uint8_t battery = data[9];
+
+    std::ostringstream json;
+
+    json << "{\n";
+    json << "    \"chairId\": \"" << (int)chairId << "\",\n";
+    json << "    \"deviceId\": \"ba84ca62714f81fc\",\n";
+    json << "    \"status\": \"1\",\n";
+    json << "    \"battery\": \"" << (int)battery << "\",\n";
+    json << "    \"latitude\": \"" << latitude << "\",\n";
+    json << "    \"longitude\": \"" << longitude << "\"\n";
+    json << "}";
+
+    return json.str();
+}
 
 
-
-
+//------------------------------------------------------------//
+void delay_ms(uint16_t milisecond) {
+    usleep(1000 * milisecond);
+}
 
 int main(void) {
-    pair_timeout_timer.setCallback(pair_timeout_timer_handler);
+
+    auto json_obj = nlohmann::json::parse(test_json_get);
+
+    // std::string chairId = json_obj["chairId"];
+    // std::string timeStart = json_obj["timeStart"];
+    
+    // std::cout << "Chair ID: " << chairId << std::endl;
+    // std::cout << "Time Start: " << timeStart << std::endl;
+
+
+    // chairId (convert string "123" -> uint8_t)
+    // std::vector<uint8_t> downlink_payload_test;
+    build_downlink_payload(test_json_get, downlink_payload_test);
+
+    print_payload_hex(downlink_payload_test);
+
 
     mosquitto_lib_init();
     struct mosquitto *mosq = mosquitto_new(nullptr, true, nullptr);
@@ -71,120 +214,30 @@ int main(void) {
     return 0;
 }
 
+// void *Thread_WebServer(void *arg) {
 
+//     while (1) {
+//         sleep (3);
+//         std::cout << "\nSending GET request..." << std::endl;
+//         sendGetRequest(getUrl);
 
+//         try {
+//             jsonResponse = json::parse(httpResponseData);
+//             receivedTemp = jsonResponse["tempSet"];
+//             receivedHumidity = jsonResponse["humidSet"];
+//             // std::string receivedVentState = jsonResponse["ventState"];
+//             httpResponseData.clear();
 
-
-void handle_uplink_data(struct mosquitto *mosq, event_data_t *evt_data) {
-    if (!evt_data->data_hex.empty()) {
-        std::cout << "[DATA] |";
-        for (uint8_t byte : evt_data->data_hex)
-            std::cout   << std::setw(2)           
-                        << std::setfill('0')      
-                        << std::hex
-                        << static_cast<int>(byte) 
-                        << "|";
-        std::cout << "is ";
-
-        std::vector<uint8_t> dldata;
-
-        dldata.push_back(evt_data->data_hex[0]);
-        dldata.push_back(evt_data->data_hex[1] + 1);
-
-        if (evt_data->data_hex[0] == VENT_DEVICE) {
-            std::cout << "Vent device" << std::endl;
-            end_device_t *pdev = vec_end_devices[evt_data->devidx];
-	    vent_pairing = pdev;
-
-            switch (evt_data->data_hex[1]){
-                case VENT_CMD_POLL_CTRL_CMD: {
-                    std::cout << "[COMMAND] Poll control command" << std::endl;
-                    dldata.push_back(pdev->state);
-                    schedule_downlink(mosq, evt_data, dldata);
-                } break;
-
-                case VENT_CMD_PAIR_REQ: {
-                    std::cout << "[COMMAND] Pair request" << std::endl;
-                    
-                    if (pdev->pair_dev == nullptr) {
-                        if (pairing == true) {
-                            pair_timeout_timer.stop();
-                            pairing = false;
-                            pdev->pair_dev = sensor_pairing;
-                            sensor_pairing->pair_dev = pdev;
-                            std::cout << "Pair successful" << std::endl;
-                        }
-                        else
-                            std::cout << "No sensor devices are waiting to be paired.." << std::endl;
-                    }
-                    else
-                        std::cout << "This device has been paired with vent " << pdev->pair_dev->deveui << std::endl;   
-
-                } break;
-                
-                default:
-                break;
-            };
-        }
-        else if (evt_data->data_hex[0] == SENSOR_DEVICE) {
-            std::cout << "Sensor device" << std::endl;
-            end_device_t *pdev = vec_end_devices[evt_data->devidx];
-
-            switch (evt_data->data_hex[1]){
-                case SENSOR_CMD_ENVDATA: {
-                    std::cout << "[COMMAND] Env data" << std::endl;
-
-                    float temp = (float)((evt_data->data_hex[2] << 8) | evt_data->data_hex[3]) / 100.0;
-                    float humi = (float)((evt_data->data_hex[4] << 8) | evt_data->data_hex[5]) / 100.0;
-
-                    pdev->battlevel = evt_data->data_hex[6];
-                    pdev->temperature = temp;
-                    pdev->humidity = humi;
-
-                    sensor_display_env_data(evt_data);
-
-                    uint16_t tempset = (uint16_t)(pdev->temperature_set * 100);
-                    dldata.push_back((tempset >> 8)&0xFF);
-                    dldata.push_back((tempset >> 0)&0xFF);
-                    schedule_downlink(mosq, evt_data, dldata);
-                
-		/* So sanh voi nhietj do dat
-		 * vent_pairing khong phai null
-		 * vent_set_state(thiet bi pdev->pair_dev);
-		 * */
-		} break;
-
-                case SENSOR_CMD_PAIR_REQ: {
-                    std::cout << "[COMMAND] Pair request" << std::endl;
-                    
-                    if (pdev->pair_dev == nullptr) {
-                        if (pairing == false) {
-                            std::cout << "Start pair" << std::endl;
-                            sensor_pairing = pdev;
-                            pairing = true;
-                            pair_timeout_timer.start(PAIR_TIMEOUT_MS);
-                        }
-                        else 
-                            std::cout << "The pairing process is in progress, please wait for completion." << std::endl;
-                    }
-                    else
-                        std::cout << "This device has been paired with vent " << pdev->pair_dev->deveui << std::endl;
-
-                } break;
-
-                case SENSOR_CMD_PAIR_STAT: {
-                    std::cout << "[COMMAND] Pair status request" << std::endl;
-                    dldata.push_back((vec_end_devices[evt_data->devidx]->pair_dev)? 0 : 1);
-                    schedule_downlink(mosq, evt_data, dldata);
-                } break;
-
-                default:
-                break;
-            };
-        }
-    } 
-}
-
+//             std::cout << "\nParsed GET response:" << std::dec << std::endl;
+//             std::cout << "Temperature: " << std::dec << receivedTemp << std::endl;
+//             std::cout << "Humidity: " << std::dec << receivedHumidity << std::endl;
+//             // std::cout << "Vent State: " << receivedVentState << std::endl;
+//         } 
+//         catch (json::parse_error &e) {
+//             std::cerr << "JSON parsing error: " << e.what() << std::endl;
+//         }
+//     }
+// }
 
 void handle_topic(struct mosquitto *mosq, const std::vector<std::string> &topic_dir, const std::string &payload) {
     if (topic_dir.size() >= 4) {
@@ -199,17 +252,31 @@ void handle_topic(struct mosquitto *mosq, const std::vector<std::string> &topic_
                 evt_data.deveui = json_data["deviceInfo"]["devEui"];
                 evt_data.devname = json_data["deviceInfo"]["deviceName"];
             }
-
-            if (evt_data.devidx = vent_find_element_index(vec_end_devices, evt_data.deveui) < 0) {
+            evt_data.devidx = vent_find_element_index(vec_end_devices, evt_data.deveui);
+            if (evt_data.devidx < 0) {
                 end_device_t *new_dev = new end_device_t;
                 new_dev->deveui = evt_data.deveui;
                 new_dev->temperature_set = 30.0;
                 vec_end_devices.push_back(new_dev);
                 evt_data.devidx = vec_end_devices.size() - 1;
             }
+
             if (json_data.contains("data")) {
                 std::string data_base64 = json_data["data"];
+                std::cout << "======" << std::endl;
+                std::cout << "data_base64: " << data_base64 << std::endl;
                 evt_data.data_hex = base64_decode(data_base64);
+                std::string hex_str(evt_data.data_hex.begin(), evt_data.data_hex.end());
+                std::cout << "evt_data.data_hex: " << hex_str << std::endl;
+                for (uint8_t byte : evt_data.data_hex) {
+                    printf("%02X ", byte);
+                }
+                printf("\n");
+
+                std::string json = generateJsonFromData(evt_data.data_hex);
+                std::cout << "Generated JSON:\n" << json << std::endl;
+
+                // std::cout << "evt_data.data_hex: " << evt_data.data_hex << std::endl;
             }
 
 
@@ -218,7 +285,9 @@ void handle_topic(struct mosquitto *mosq, const std::vector<std::string> &topic_
                                     << ", Eui: " << evt_data.deveui
                                     << ", Name: " << evt_data.devname << std::endl;
 
-                handle_uplink_data(mosq, &evt_data);
+                // std::vector<uint8_t> downlink_payload = {0xA1, 0xB2, 0xC3, 0xD4};
+                schedule_downlink(mosq, &evt_data, downlink_payload_test);
+                // handle_uplink_data(mosq, &evt_data);
 
                 std::cout << "==========================================================================" << std::endl;
             } 
@@ -228,7 +297,7 @@ void handle_topic(struct mosquitto *mosq, const std::vector<std::string> &topic_
 
 int schedule_downlink(struct mosquitto *mosq, event_data_t *evt_data, std::vector<uint8_t> down_data_hex) {
     std::string topic  = "application/" + evt_data->appid + "/device/" + evt_data->deveui + "/command/down";
-
+    std::cout << "topic downlink: " << topic << std::endl;
     std::string base64_str = base64_encode(down_data_hex);
     std::ostringstream json;
     json    << "{"
@@ -245,13 +314,6 @@ int schedule_downlink(struct mosquitto *mosq, event_data_t *evt_data, std::vecto
     return 0;
 }
 
-void pair_timeout_timer_handler(void) {
-    pairing = false;
-    std::cout << "Pairing failed, no device A is available to pair." << std::endl;
-}
-
-
-
 void mqttc_on_connect(struct mosquitto *mosq, void *userdata, int state) {
     if (state == 0) {
         std::cout << "Connected to MQTT broker!" << std::endl;
@@ -261,41 +323,21 @@ void mqttc_on_connect(struct mosquitto *mosq, void *userdata, int state) {
     }
 }
 
+
+void printVector(const std::vector<std::string>& vec) {
+    std::cout << "Topic_dir: ";
+    for (const auto& item : vec) {
+        std::cout << item << " ";
+    }
+    std::cout << std::endl;
+}
+
 void mqttc_on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message) {
     std::string topic = message->topic;
+    std::cout << "Receive Topic: " << topic << std::endl;
     std::string payload(static_cast<char*>(message->payload), message->payloadlen);
     std::vector<std::string> topic_dir = split_string(topic, '/');
-
+    // printVector(topic_dir);
+    // std::cout << "payload: " << payload << std::endl;
     handle_topic(mosq, topic_dir, payload);
 }
-
-
-
-
-void vent_set_state(std::string deveui, uint8_t state) {
-    uint8_t idx = vent_find_element_index(vec_end_devices, deveui);
-    if (idx >= 0) {
-        vec_end_devices[idx]->state = state;
-        std::cout << "Device " << deveui << " set vent state to " << ((state)? "ON":"OFF") << std::endl;
-    }
-}
-
-void sensor_display_env_data(event_data_t *evt_data) {
-    end_device_t *pdev = vec_end_devices[evt_data->devidx];
-
-    std::cout << "= " << evt_data->deveui << " =" << std::endl;
-    std::cout << "==== TEMP: " << pdev->temperature << " ====" << std::endl;
-    std::cout << "==== HUMI: " << pdev->humidity << " ====" << std::endl;
-    std::cout << "==== BATT: " << pdev->battlevel << " ====" << std::endl;
-}
-
-void sensor_change_set_temperature(std::string deveui, float set) {
-    uint8_t idx = vent_find_element_index(vec_end_devices, deveui);
-    if (idx >= 0) {
-        vec_end_devices[idx]->temperature_set = set;
-        std::cout << "Device " << deveui << " set temperature has been changed to " << set << std::endl;
-    }
-}
-
-
-
