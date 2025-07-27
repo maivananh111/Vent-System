@@ -12,7 +12,7 @@
 # GPIO mapping has to be adapted with HW
 #
 
-SX1302_RESET_PIN=140     # SX1302 reset
+SX1302_RESET_PIN=129     # SX1302 reset
 #L70_R_RESET_PIN=70      # L70-R reset
 
 WAIT_GPIO() {
